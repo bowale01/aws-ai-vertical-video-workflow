@@ -24,17 +24,17 @@ This is the same approach used by DAZN for live football on TikTok.
 │ (Encoder)    │    │      │   AWS Elemental Inference               │            │
 │              │    │      │  ┌──────────┐ ┌──────────┐ ┌─────────┐ │            │
 │ 16:9 source  │    │  ②──▶│  │ Analysis │▶│Reasoning │▶│Smart    │ │            │
-│ (webcam/     │    │      │  │          │ │          │ │Crop     │ │            │
-│  screen/     │    │      │  └──────────┘ └──────────┘ └─────────┘ │            │
-│  video file) │    │      │                    │ Highlight Clips ⑥  │            │
-│              │    │      │                    └──────────────────┐ │            │
-│ 1920x1080    │    │      └──────────────────────────────────────┐│ │            │
-│ 30fps        │    │                   ③ crop coords             ││ │            │
-│ 6 Mbps       │    │  ┌───────────┐◀──────────────────────────────┘│ │            │
+│ (football    │    │      │  │          │ │          │ │Crop     │ │            │
+│  clip loop)  │    │      │  └──────────┘ └──────────┘ └─────────┘ │            │
+│              │    │      │                    │ Highlight Clips ⑥  │            │
+│ 1920x1080    │    │      │                    └──────────────────┐ │            │
+│ 30fps        │    │      └──────────────────────────────────────┐│ │            │
+│ 6 Mbps CBR   │    │                   ③ crop coords             ││ │            │
+│ H.264 High   │    │  ┌───────────┐◀──────────────────────────────┘│ │            │
 └──────┬───────┘    │  │  AWS      │①                               │ │            │
        │            │  │ Elemental │                                │ │            │
-       │ SRT Push   │  │ MediaLive │                                │ │            │
-       │ :9000      │  │           │                                │ │            │
+       │ RTMP Push  │  │ MediaLive │                                │ │            │
+       │ :1935      │  │           │                                │ │            │
        └────────────┼─▶│ Input  ④  │                                │ │            │
                     │  │ Encoding  │                                │ │            │
                     │  └─────┬─────┘                                │ │            │
@@ -66,7 +66,8 @@ This is the same approach used by DAZN for live football on TikTok.
                     │        │                          │            │            │
                     │        │                 ┌────────▼─────────┐  │            │
                     │        │                 │    Amazon S3     │  │            │
-                    │        │                 │  (clips bucket)  │  │            │
+                    │        │                 │  (clips bucket + │  │            │
+                    │        │                 │   live archive)  │  │            │
                     │        │                 └────────┬─────────┘  │            │
                     │        ▼                          ▼            │            │
                     │  ┌──────────────────────────────────────────┐  │            │
