@@ -1,0 +1,19 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowCloudFrontServicePrincipal",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudfront.amazonaws.com"
+      },
+      "Action": "mediapackagev2:GetObject",
+      "Resource": "PLACEHOLDER - deploy.ps1 generates this automatically",
+      "Condition": {
+        "StringEquals": {
+          "AWS:SourceArn": "PLACEHOLDER - deploy.ps1 generates this automatically"
+        }
+      }
+    }
+  ]
+}

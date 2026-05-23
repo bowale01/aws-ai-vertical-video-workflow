@@ -1,0 +1,29 @@
+# Temporary files generated during deployment (contain account-specific data)
+cf-config.json
+
+# AWS credentials and config
+.aws/
+*.pem
+*.key
+
+# Environment variables
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node modules (if any tooling is added later)
+node_modules/
+
+# Logs
+*.log

@@ -1,0 +1,1028 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Elemental Inference – AI-powered vertical video (9:16) workflow.
+  Ingests SRT push stream from OBS Studio, applies smart cropping via Elemental Inference,
+  outputs 1080x1920 vertical stream simultaneously to:
+  - HLS via MediaPackage v2 + CloudFront (live viewing on phone/browser)
+  - RTMP direct push to TikTok LIVE, YouTube Shorts, Instagram Reels, Facebook LIVE
+  Also harvests highlight clips via EventBridge + Step Functions + MediaConvert → S3.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: vertical-video-demo
+    Description: Prefix for all resource names
+
+  SrtPort:
+    Type: Number
+    Default: 1935
+    Description: Port for RTMP push input on MediaLive (default RTMP port)
+
+  VideoBitrate:
+    Type: Number
+    Default: 6000000
+    Description: Output video bitrate in bps (4500-6000 kbps adaptive streaming)
+
+  AudioBitrate:
+    Type: Number
+    Default: 192000
+    Description: Output audio bitrate in bps (128-192 kbps per spec)
+
+  HlsSegmentDuration:
+    Type: Number
+    Default: 2
+    Description: HLS segment duration in seconds (2s for low latency)
+
+  # Social media RTMP stream keys (optional - leave blank to disable)
+  TikTokStreamKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: TikTok LIVE stream key (optional - get from TikTok LIVE Studio)
+
+  YouTubeStreamKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: YouTube LIVE stream key (optional - get from YouTube Studio)
+
+  InstagramStreamKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Instagram/Facebook LIVE stream key (optional - get from Creator Studio)
+
+  FacebookStreamKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Facebook LIVE stream key (optional - get from Creator Studio)
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  EnableTikTok: !Not [!Equals [!Ref TikTokStreamKey, ""]]
+  EnableYouTube: !Not [!Equals [!Ref YouTubeStreamKey, ""]]
+  EnableInstagram: !Not [!Equals [!Ref InstagramStreamKey, ""]]
+  EnableFacebook: !Not [!Equals [!Ref FacebookStreamKey, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 – stores harvested VOD clips and MediaConvert output
+  # -------------------------------------------------------------------------
+  ClipsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-clips-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldClips
+            Status: Enabled
+            ExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET]
+            AllowedOrigins: ["*"]
+            MaxAge: 3000
+
+  ClipsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClipsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudFrontReadAccess
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${ClipsBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # -------------------------------------------------------------------------
+  # S3 – live stream archive (stores full HLS segments from MediaPackage)
+  # -------------------------------------------------------------------------
+  LiveArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-live-archive-${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLiveSegments
+            Status: Enabled
+            ExpirationInDays: 7      # Keep 7 days of live archive
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA   # Move to cheaper storage after 30 days
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET]
+            AllowedOrigins: ["*"]
+            MaxAge: 3000
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-live-archive"
+
+  LiveArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LiveArchiveBucket
+      PolicyDocument:
+        Statement:
+          - Sid: CloudFrontReadAccess
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${LiveArchiveBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+          - Sid: MediaPackageWriteAccess
+            Effect: Allow
+            Principal:
+              Service: mediapackagev2.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub "arn:aws:s3:::${LiveArchiveBucket}"
+              - !Sub "arn:aws:s3:::${LiveArchiveBucket}/*"
+
+  # -------------------------------------------------------------------------
+  # IAM – MediaLive role
+  # -------------------------------------------------------------------------
+  MediaLiveRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-medialive-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: medialive.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess
+      Policies:
+        - PolicyName: MediaLivePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediapackagev2:PutObject
+                  - mediapackagev2:ListChannels
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - elemental-inference:*
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # IAM – MediaPackage v2 role
+  # -------------------------------------------------------------------------
+  MediaPackageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mediapackage-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediapackagev2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaPackagePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${ClipsBucket}"
+                  - !Sub "arn:aws:s3:::${ClipsBucket}/*"
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-live-archive-${AWS::AccountId}"
+                  - !Sub "arn:aws:s3:::${EnvironmentName}-live-archive-${AWS::AccountId}/*"
+
+  # -------------------------------------------------------------------------
+  # IAM – MediaConvert role
+  # -------------------------------------------------------------------------
+  MediaConvertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-mediaconvert-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: mediaconvert.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MediaConvertPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ClipsBucket}"
+                  - !Sub "arn:aws:s3:::${ClipsBucket}/*"
+
+  # -------------------------------------------------------------------------
+  # IAM – Step Functions role
+  # -------------------------------------------------------------------------
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-stepfunctions-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mediapackagev2:CreateHarvestJob
+                  - mediapackagev2:GetHarvestJob
+                  - mediaconvert:CreateJob
+                  - mediaconvert:GetJob
+                  - s3:PutObject
+                  - s3:GetObject
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # -------------------------------------------------------------------------
+  # IAM – EventBridge role (to trigger Step Functions)
+  # -------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStartSFN
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref HighlightClipStateMachine
+
+  # -------------------------------------------------------------------------
+  # MediaLive – Input Security Group (allow SRT from anywhere for demo)
+  # -------------------------------------------------------------------------
+  MediaLiveInputSecurityGroup:
+    Type: AWS::MediaLive::InputSecurityGroup
+    Properties:
+      WhitelistRules:
+        - Cidr: "0.0.0.0/0"   # Restrict to your encoder IP in production
+      Tags:
+        Name: !Sub "${EnvironmentName}-isg"
+
+  # -------------------------------------------------------------------------
+  # MediaLive – SRT Push Input
+  # -------------------------------------------------------------------------
+  MediaLiveSrtInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub "${EnvironmentName}-rtmp-input"
+      Type: RTMP_PUSH
+      InputSecurityGroups:
+        - !Ref MediaLiveInputSecurityGroup
+      Destinations:
+        - StreamName: !Sub "${EnvironmentName}/stream"
+      Tags:
+        Name: !Sub "${EnvironmentName}-rtmp-input"
+
+  # -------------------------------------------------------------------------
+  # MediaPackage v2 – Channel Group
+  # -------------------------------------------------------------------------
+  MediaPackageChannelGroup:
+    Type: AWS::MediaPackageV2::ChannelGroup
+    Properties:
+      ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+      Description: Channel group for vertical video demo
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-channel-group"
+
+  # -------------------------------------------------------------------------
+  # MediaPackage v2 – Channel
+  # -------------------------------------------------------------------------
+  MediaPackageChannel:
+    Type: AWS::MediaPackageV2::Channel
+    DependsOn: MediaPackageChannelGroup
+    Properties:
+      ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+      ChannelName: !Sub "${EnvironmentName}-channel"
+      Description: Vertical video live channel
+      InputType: HLS
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-channel"
+
+  # -------------------------------------------------------------------------
+  # MediaPackage v2 – HLS Origin Endpoint
+  # -------------------------------------------------------------------------
+  MediaPackageHlsEndpoint:
+    Type: AWS::MediaPackageV2::OriginEndpoint
+    DependsOn: MediaPackageChannel
+    Properties:
+      ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+      ChannelName: !Sub "${EnvironmentName}-channel"
+      OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
+      ContainerType: TS
+      HlsManifests:
+        - ManifestName: index
+          ManifestWindowSeconds: 30
+          ProgramDateTimeIntervalSeconds: 60
+          ScteHls:
+            AdMarkerHls: DATERANGE
+      Segment:
+        SegmentDurationSeconds: !Ref HlsSegmentDuration
+        SegmentName: segment
+        TsUseAudioRenditionGroup: false
+        IncludeIframeOnlyStreams: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-hls-endpoint"
+
+  # -------------------------------------------------------------------------
+  # MediaLive – Channel (16:9 in → 9:16 out with Elemental Inference)
+  # -------------------------------------------------------------------------
+  MediaLiveChannel:
+    Type: AWS::MediaLive::Channel
+    DependsOn: MediaPackageHlsEndpoint
+    Properties:
+      Name: !Sub "${EnvironmentName}-channel"
+      RoleArn: !GetAtt MediaLiveRole.Arn
+      ChannelClass: SINGLE_PIPELINE
+      InputSpecification:
+        Codec: AVC
+        MaximumBitrate: MAX_20_MBPS
+        Resolution: HD
+
+      InputAttachments:
+        - InputAttachmentName: srt-source
+          InputId: !Ref MediaLiveSrtInput
+          InputSettings:
+            SourceEndBehavior: CONTINUE
+            InputFilter: AUTO
+            FilterStrength: 1
+            DeblockFilter: DISABLED
+            DenoiseFilter: DISABLED
+
+      EncoderSettings:
+        # Global configuration
+        GlobalConfiguration:
+          InputEndAction: SWITCH_AND_LOOP_INPUTS
+          OutputTimingSource: SYSTEM_CLOCK
+          SupportLowFramerateInputs: DISABLED
+
+        # Timecode config
+        TimecodeConfig:
+          Source: SYSTEMCLOCK
+
+        # --- Video descriptions ---
+        VideoDescriptions:
+          - Name: video_1080x1920
+            Width: 1080
+            Height: 1920
+            RespondToAfd: NONE
+            ScalingBehavior: STRETCH_TO_OUTPUT
+            Sharpness: 50
+            CodecSettings:
+              H264Settings:
+                AdaptiveQuantization: HIGH
+                AfdSignaling: NONE
+                Bitrate: !Ref VideoBitrate
+                BufFillPct: 90
+                BufSize: 12000000
+                ColorMetadata: INSERT
+                ColorSpaceSettings:
+                  ColorSpacePassthroughSettings: {}
+                EntropyEncoding: CABAC
+                FlickerAq: ENABLED
+                ForceFieldPictures: DISABLED
+                FramerateControl: SPECIFIED
+                FramerateDenominator: 1
+                FramerateNumerator: 30
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 2
+                GopSize: 60
+                GopSizeUnits: FRAMES
+                Level: H264_LEVEL_4_1
+                LookAheadRateControl: HIGH
+                MaxBitrate: 8000000
+                MinIInterval: 0
+                NumRefFrames: 3
+                ParControl: SPECIFIED
+                ParDenominator: 9    # 9:16 PAR
+                ParNumerator: 16
+                Profile: HIGH
+                QvbrQualityLevel: 8
+                RateControlMode: QVBR
+                ScanType: PROGRESSIVE
+                SceneChangeDetect: ENABLED
+                SpatialAq: ENABLED
+                SubgopLength: FIXED
+                Syntax: DEFAULT
+                TemporalAq: ENABLED
+                TimecodeInsertion: DISABLED
+
+        # --- Audio descriptions ---
+        AudioDescriptions:
+          - Name: audio_aac_192k
+            AudioSelectorName: default
+            CodecSettings:
+              AacSettings:
+                Bitrate: 192000
+                CodingMode: CODING_MODE_2_0
+                InputType: NORMAL
+                Profile: LC
+                RateControlMode: CBR
+                RawFormat: NONE
+                SampleRate: 48000
+                Spec: MPEG4
+
+        # --- Output groups ---
+        OutputGroups:
+          # HLS output to MediaPackage
+          - Name: MediaPackageGroup
+            OutputGroupSettings:
+              MediaPackageGroupSettings:
+                Destination:
+                  DestinationRefId: mediapackage-dest
+            Outputs:
+              - OutputName: vertical-1080p-hls
+                VideoDescriptionName: video_1080x1920
+                AudioDescriptionNames:
+                  - audio_aac_192k
+                OutputSettings:
+                  MediaPackageOutputSettings: {}
+
+          # RTMP output to TikTok LIVE
+          - !If
+            - EnableTikTok
+            - Name: TikTokRtmpGroup
+              OutputGroupSettings:
+                RtmpGroupSettings:
+                  AuthenticationScheme: COMMON
+                  CacheFullBehavior: DISCONNECT_IMMEDIATELY
+                  CacheLength: 30
+                  CaptionData: EXCLUDE
+                  RestartDelay: 15
+                  InputLossAction: EMIT_OUTPUT
+              Outputs:
+                - OutputName: tiktok-1080p
+                  VideoDescriptionName: video_1080x1920
+                  AudioDescriptionNames:
+                    - audio_aac_192k
+                  OutputSettings:
+                    RtmpOutputSettings:
+                      ConnectionRetryInterval: 2
+                      NumRetries: 10
+                      Destination:
+                        DestinationRefId: tiktok-dest
+            - !Ref AWS::NoValue
+
+          # RTMP output to YouTube LIVE
+          - !If
+            - EnableYouTube
+            - Name: YouTubeRtmpGroup
+              OutputGroupSettings:
+                RtmpGroupSettings:
+                  AuthenticationScheme: COMMON
+                  CacheFullBehavior: DISCONNECT_IMMEDIATELY
+                  CacheLength: 30
+                  CaptionData: EXCLUDE
+                  RestartDelay: 15
+                  InputLossAction: EMIT_OUTPUT
+              Outputs:
+                - OutputName: youtube-1080p
+                  VideoDescriptionName: video_1080x1920
+                  AudioDescriptionNames:
+                    - audio_aac_192k
+                  OutputSettings:
+                    RtmpOutputSettings:
+                      ConnectionRetryInterval: 2
+                      NumRetries: 10
+                      Destination:
+                        DestinationRefId: youtube-dest
+            - !Ref AWS::NoValue
+
+          # RTMP output to Instagram LIVE
+          - !If
+            - EnableInstagram
+            - Name: InstagramRtmpGroup
+              OutputGroupSettings:
+                RtmpGroupSettings:
+                  AuthenticationScheme: COMMON
+                  CacheFullBehavior: DISCONNECT_IMMEDIATELY
+                  CacheLength: 30
+                  CaptionData: EXCLUDE
+                  RestartDelay: 15
+                  InputLossAction: EMIT_OUTPUT
+              Outputs:
+                - OutputName: instagram-1080p
+                  VideoDescriptionName: video_1080x1920
+                  AudioDescriptionNames:
+                    - audio_aac_192k
+                  OutputSettings:
+                    RtmpOutputSettings:
+                      ConnectionRetryInterval: 2
+                      NumRetries: 10
+                      Destination:
+                        DestinationRefId: instagram-dest
+            - !Ref AWS::NoValue
+
+          # RTMP output to Facebook LIVE
+          - !If
+            - EnableFacebook
+            - Name: FacebookRtmpGroup
+              OutputGroupSettings:
+                RtmpGroupSettings:
+                  AuthenticationScheme: COMMON
+                  CacheFullBehavior: DISCONNECT_IMMEDIATELY
+                  CacheLength: 30
+                  CaptionData: EXCLUDE
+                  RestartDelay: 15
+                  InputLossAction: EMIT_OUTPUT
+              Outputs:
+                - OutputName: facebook-1080p
+                  VideoDescriptionName: video_1080x1920
+                  AudioDescriptionNames:
+                    - audio_aac_192k
+                  OutputSettings:
+                    RtmpOutputSettings:
+                      ConnectionRetryInterval: 2
+                      NumRetries: 10
+                      Destination:
+                        DestinationRefId: facebook-dest
+            - !Ref AWS::NoValue
+
+      Destinations:
+        - Id: mediapackage-dest
+          MediaPackageSettings:
+            - ChannelId: !Sub "${EnvironmentName}-channel"
+        - !If
+          - EnableTikTok
+          - Id: tiktok-dest
+            Settings:
+              - Url: !Sub "rtmp://push.tiktok.com/live/${TikTokStreamKey}"
+          - !Ref AWS::NoValue
+        - !If
+          - EnableYouTube
+          - Id: youtube-dest
+            Settings:
+              - Url: !Sub "rtmp://a.rtmp.youtube.com/live2/${YouTubeStreamKey}"
+          - !Ref AWS::NoValue
+        - !If
+          - EnableInstagram
+          - Id: instagram-dest
+            Settings:
+              - Url: !Sub "rtmps://live-api-s.facebook.com:443/rtmp/${InstagramStreamKey}"
+          - !Ref AWS::NoValue
+        - !If
+          - EnableFacebook
+          - Id: facebook-dest
+            Settings:
+              - Url: !Sub "rtmps://live-api-s.facebook.com:443/rtmp/${FacebookStreamKey}"
+          - !Ref AWS::NoValue
+
+      Tags:
+        Name: !Sub "${EnvironmentName}-channel"
+
+  # -------------------------------------------------------------------------
+  # CloudFront – Origin Access Control for MediaPackage
+  # -------------------------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${EnvironmentName}-mediapackage-oac"
+        OriginAccessControlOriginType: mediapackagev2
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -------------------------------------------------------------------------
+  # CloudFront – Origin Access Control for S3
+  # -------------------------------------------------------------------------
+  CloudFrontS3OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${EnvironmentName}-s3-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -------------------------------------------------------------------------
+  # CloudFront – Distribution (live HLS + VOD clips)
+  # -------------------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${EnvironmentName} vertical video CDN"
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100   # US/EU only – cheapest
+
+        Origins:
+          # Live origin – MediaPackage v2
+          # Domain is the MediaPackage endpoint hostname (extracted from the full URL)
+          - Id: MediaPackageLiveOrigin
+            DomainName: !Sub "${EnvironmentName}-channel-group.mediapackagev2.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !Ref CloudFrontOAC
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+
+          # VOD origin – S3 clips bucket
+          - Id: S3ClipsOrigin
+            DomainName: !GetAtt ClipsBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontS3OAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+          # Live archive origin – S3 live archive bucket
+          - Id: S3LiveArchiveOrigin
+            DomainName: !GetAtt LiveArchiveBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontS3OAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+
+        DefaultCacheBehavior:
+          TargetOriginId: MediaPackageLiveOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 08627262-05a9-4f76-9ded-b50ca2e3a84f  # Elemental MediaPackage managed policy
+          OriginRequestPolicyId: 775133bc-15f2-49f9-abea-afb2e0bf67d2  # CORS-S3Origin
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+
+        CacheBehaviors:
+          # VOD clips path
+          - PathPattern: "/clips/*"
+            TargetOriginId: S3ClipsOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+          # Live archive path
+          - PathPattern: "/archive/*"
+            TargetOriginId: S3LiveArchiveOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-distribution"
+
+  # -------------------------------------------------------------------------
+  # EventBridge – Rule triggered by Elemental Inference highlight events
+  # -------------------------------------------------------------------------
+  InferenceHighlightRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${EnvironmentName}-inference-highlight"
+      Description: Triggered when Elemental Inference detects a highlight moment
+      EventPattern:
+        source:
+          - aws.elemental-inference
+        detail-type:
+          - "Elemental Inference Highlight Detected"
+        detail:
+          channelArn:
+            - !Sub "arn:aws:medialive:${AWS::Region}:${AWS::AccountId}:channel:${MediaLiveChannel}"
+      State: ENABLED
+      Targets:
+        - Id: TriggerHighlightSFN
+          Arn: !Ref HighlightClipStateMachine
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # -------------------------------------------------------------------------
+  # Step Functions – Highlight clip state machine
+  # Triggered by EventBridge when Inference detects a key moment.
+  # 1. Creates a MediaPackage harvest job to extract the clip segment
+  # 2. Waits for harvest to complete
+  # 3. Submits a MediaConvert job to produce MP4 + HLS VOD assets
+  # -------------------------------------------------------------------------
+  HighlightClipStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${EnvironmentName}-highlight-clip"
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        Comment: Harvest highlight clip from MediaPackage and transcode with MediaConvert
+        StartAt: CreateHarvestJob
+        States:
+
+          CreateHarvestJob:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:mediapackagev2:createHarvestJob
+            Parameters:
+              ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+              ChannelName: !Sub "${EnvironmentName}-channel"
+              OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
+              HarvestJobName.$: "States.Format('harvest-{}', $$.Execution.Name)"
+              HarvestedManifests:
+                HlsManifests:
+                  - ManifestName: index
+              ScheduleConfiguration:
+                StartTime.$: "$.detail.startTime"
+                EndTime.$: "$.detail.endTime"
+              Destination:
+                S3Destination:
+                  BucketName: !Ref ClipsBucket
+                  DestinationPath: "harvested/"
+            ResultPath: "$.harvestJob"
+            Next: WaitForHarvest
+
+          WaitForHarvest:
+            Type: Wait
+            Seconds: 30
+            Next: CheckHarvestStatus
+
+          CheckHarvestStatus:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:mediapackagev2:getHarvestJob
+            Parameters:
+              ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+              ChannelName: !Sub "${EnvironmentName}-channel"
+              OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
+              HarvestJobName.$: "$.harvestJob.HarvestJob.HarvestJobName"
+            ResultPath: "$.harvestStatus"
+            Next: IsHarvestComplete
+
+          IsHarvestComplete:
+            Type: Choice
+            Choices:
+              - Variable: "$.harvestStatus.HarvestJob.Status"
+                StringEquals: COMPLETED
+                Next: SubmitMediaConvertJob
+              - Variable: "$.harvestStatus.HarvestJob.Status"
+                StringEquals: FAILED
+                Next: HarvestFailed
+            Default: WaitForHarvest
+
+          SubmitMediaConvertJob:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:mediaconvert:createJob
+            Parameters:
+              Role: !GetAtt MediaConvertRole.Arn
+              Settings:
+                Inputs:
+                  - FileInput.$: >-
+                      States.Format('s3://{}/harvested/{}.m3u8',
+                        '${ClipsBucket}',
+                        $.harvestJob.HarvestJob.HarvestJobName)
+                    AudioSelectors:
+                      Audio Selector 1:
+                        DefaultSelection: DEFAULT
+                    VideoSelector: {}
+                    TimecodeSource: ZEROBASED
+                OutputGroups:
+                  # MP4 output
+                  - Name: MP4Output
+                    OutputGroupSettings:
+                      Type: FILE_GROUP_SETTINGS
+                      FileGroupSettings:
+                        Destination.$: >-
+                          States.Format('s3://{}/clips/{}/',
+                            '${ClipsBucket}',
+                            $.harvestJob.HarvestJob.HarvestJobName)
+                    Outputs:
+                      - NameModifier: _1080x1920
+                        ContainerSettings:
+                          Container: MP4
+                          Mp4Settings:
+                            CslgAtom: INCLUDE
+                            FreeSpaceBox: EXCLUDE
+                            MoovPlacement: PROGRESSIVE_DOWNLOAD
+                        VideoDescription:
+                          Width: 1080
+                          Height: 1920
+                          CodecSettings:
+                            Codec: H_264
+                            H264Settings:
+                              Bitrate: 6000000
+                              RateControlMode: QVBR
+                              QvbrSettings:
+                                QvbrQualityLevel: 8
+                              CodecProfile: HIGH
+                              CodecLevel: LEVEL_4_1
+                              FramerateControl: SPECIFIED
+                              FramerateNumerator: 30
+                              FramerateDenominator: 1
+                              GopSize: 60
+                              GopSizeUnits: FRAMES
+                              SceneChangeDetect: ENABLED
+                        AudioDescriptions:
+                          - CodecSettings:
+                              Codec: AAC
+                              AacSettings:
+                                Bitrate: 192000
+                                CodingMode: CODING_MODE_2_0
+                                SampleRate: 48000
+                  # HLS VOD output
+                  - Name: HLSOutput
+                    OutputGroupSettings:
+                      Type: HLS_GROUP_SETTINGS
+                      HlsGroupSettings:
+                        Destination.$: >-
+                          States.Format('s3://{}/clips/{}/hls/',
+                            '${ClipsBucket}',
+                            $.harvestJob.HarvestJob.HarvestJobName)
+                        SegmentLength: 6
+                        MinSegmentLength: 0
+                    Outputs:
+                      - NameModifier: _1080x1920
+                        ContainerSettings:
+                          Container: M3U8
+                        VideoDescription:
+                          Width: 1080
+                          Height: 1920
+                          CodecSettings:
+                            Codec: H_264
+                            H264Settings:
+                              Bitrate: 6000000
+                              RateControlMode: QVBR
+                              QvbrSettings:
+                                QvbrQualityLevel: 8
+                              FramerateControl: SPECIFIED
+                              FramerateNumerator: 30
+                              FramerateDenominator: 1
+                              GopSize: 60
+                              GopSizeUnits: FRAMES
+                        AudioDescriptions:
+                          - CodecSettings:
+                              Codec: AAC
+                              AacSettings:
+                                Bitrate: 192000
+                                CodingMode: CODING_MODE_2_0
+                                SampleRate: 48000
+            ResultPath: "$.mediaConvertJob"
+            Next: ClipComplete
+
+          ClipComplete:
+            Type: Succeed
+
+          HarvestFailed:
+            Type: Fail
+            Error: HarvestJobFailed
+            Cause: MediaPackage harvest job did not complete successfully
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-highlight-clip"
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group – MediaLive channel logs
+  # -------------------------------------------------------------------------
+  MediaLiveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/medialive/${EnvironmentName}"
+      RetentionInDays: 7
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  MediaLiveChannelId:
+    Description: MediaLive Channel ID
+    Value: !Ref MediaLiveChannel
+    Export:
+      Name: !Sub "${EnvironmentName}-medialive-channel-id"
+
+  MediaLiveSrtInputId:
+    Description: MediaLive SRT Input ID (use this to get the SRT endpoint URL)
+    Value: !Ref MediaLiveSrtInput
+    Export:
+      Name: !Sub "${EnvironmentName}-srt-input-id"
+
+  MediaPackageChannelGroupName:
+    Description: MediaPackage v2 Channel Group Name
+    Value: !Sub "${EnvironmentName}-channel-group"
+    Export:
+      Name: !Sub "${EnvironmentName}-mp-channel-group"
+
+  MediaPackageChannelName:
+    Description: MediaPackage v2 Channel Name
+    Value: !Sub "${EnvironmentName}-channel"
+    Export:
+      Name: !Sub "${EnvironmentName}-mp-channel"
+
+  HlsPlaybackUrl:
+    Description: CloudFront HLS playback URL (append /index.m3u8 path from MediaPackage endpoint)
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${EnvironmentName}-playback-url"
+
+  ClipsBucketName:
+    Description: S3 bucket for harvested highlight clips
+    Value: !Ref ClipsBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-clips-bucket"
+
+  LiveArchiveBucketName:
+    Description: S3 bucket for full live stream archive (7-day retention)
+    Value: !Ref LiveArchiveBucket
+    Export:
+      Name: !Sub "${EnvironmentName}-live-archive-bucket"
+
+  HighlightStateMachineArn:
+    Description: Step Functions state machine ARN for highlight clipping
+    Value: !Ref HighlightClipStateMachine
+    Export:
+      Name: !Sub "${EnvironmentName}-sfn-arn"
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${EnvironmentName}-cloudfront-domain"
+
+  TikTokDeliveryStatus:
+    Description: TikTok LIVE delivery status
+    Value: !If [EnableTikTok, "ENABLED – pushing to rtmp://push.tiktok.com/live/", "DISABLED – no stream key provided"]
+
+  YouTubeDeliveryStatus:
+    Description: YouTube LIVE delivery status
+    Value: !If [EnableYouTube, "ENABLED – pushing to rtmp://a.rtmp.youtube.com/live2/", "DISABLED – no stream key provided"]
+
+  InstagramDeliveryStatus:
+    Description: Instagram LIVE delivery status
+    Value: !If [EnableInstagram, "ENABLED – pushing to rtmps://live-api-s.facebook.com:443/rtmp/", "DISABLED – no stream key provided"]
+
+  FacebookDeliveryStatus:
+    Description: Facebook LIVE delivery status
+    Value: !If [EnableFacebook, "ENABLED – pushing to rtmps://live-api-s.facebook.com:443/rtmp/", "DISABLED – no stream key provided"]
+
+  SocialDeliverySummary:
+    Description: Summary of active social platform outputs
+    Value: !Sub
+      - "TikTok:${TT} | YouTube:${YT} | Instagram:${IG} | Facebook:${FB}"
+      - TT: !If [EnableTikTok, "ON", "OFF"]
+        YT: !If [EnableYouTube, "ON", "OFF"]
+        IG: !If [EnableInstagram, "ON", "OFF"]
+        FB: !If [EnableFacebook, "ON", "OFF"]
