@@ -1,19 +1,19 @@
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "AllowCloudFrontServicePrincipal",
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "cloudfront.amazonaws.com"
-      },
-      "Action": "mediapackagev2:GetObject",
-      "Resource": "PLACEHOLDER - deploy.ps1 generates this automatically",
-      "Condition": {
-        "StringEquals": {
-          "AWS:SourceArn": "PLACEHOLDER - deploy.ps1 generates this automatically"
-        }
-      }
-    }
-  ]
+﻿{
+    "Version":  "2012-10-17",
+    "Statement":  [
+                      {
+                          "Action":  "mediapackagev2:GetObject",
+                          "Condition":  {
+                                            "StringEquals":  {
+                                                                 "AWS:SourceArn":  "arn:aws:cloudfront::743508003148:distribution/E3CYUFSULUGPRN"
+                                                             }
+                                        },
+                          "Principal":  {
+                                            "Service":  "cloudfront.amazonaws.com"
+                                        },
+                          "Resource":  "arn:aws:mediapackagev2:us-east-1:743508003148:channelGroup/vertical-video-demo-channel-group/channel/vertical-video-demo-channel/originEndpoint/vertical-video-demo-hls-endpoint",
+                          "Effect":  "Allow",
+                          "Sid":  "AllowCloudFrontServicePrincipal"
+                      }
+                  ]
 }

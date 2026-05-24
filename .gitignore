@@ -1,5 +1,7 @@
 # Temporary files generated during deployment (contain account-specific data)
 cf-config.json
+channel-update.json
+mp-policy.json
 
 # AWS credentials and config
 .aws/

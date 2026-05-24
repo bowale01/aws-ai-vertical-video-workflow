@@ -397,15 +397,32 @@ Resources:
           Value: !Sub "${EnvironmentName}-hls-endpoint"
 
   # -------------------------------------------------------------------------
+  # Elemental Inference – Feed for AI smart cropping
+  # Note: For smart crop, do NOT include a cropping output in the feed.
+  # MediaLive will create the cropping output automatically when the channel starts.
+  # -------------------------------------------------------------------------
+  ElementalInferenceFeed:
+    Type: AWS::ElementalInference::Feed
+    Properties:
+      Name: !Sub "${EnvironmentName}-feed"
+      Outputs: []
+      Tags:
+        Name: !Sub "${EnvironmentName}-feed"
+
+  # -------------------------------------------------------------------------
   # MediaLive – Channel (16:9 in → 9:16 out with Elemental Inference)
   # -------------------------------------------------------------------------
   MediaLiveChannel:
     Type: AWS::MediaLive::Channel
-    DependsOn: MediaPackageHlsEndpoint
+    DependsOn:
+      - MediaPackageHlsEndpoint
+      - ElementalInferenceFeed
     Properties:
       Name: !Sub "${EnvironmentName}-channel"
       RoleArn: !GetAtt MediaLiveRole.Arn
       ChannelClass: SINGLE_PIPELINE
+      InferenceSettings:
+        FeedArn: !GetAtt ElementalInferenceFeed.Arn
       InputSpecification:
         Codec: AVC
         MaximumBitrate: MAX_20_MBPS
@@ -438,7 +455,7 @@ Resources:
             Width: 1080
             Height: 1920
             RespondToAfd: NONE
-            ScalingBehavior: STRETCH_TO_OUTPUT
+            ScalingBehavior: SMART_CROP
             Sharpness: 50
             CodecSettings:
               H264Settings:
@@ -467,8 +484,8 @@ Resources:
                 MinIInterval: 0
                 NumRefFrames: 3
                 ParControl: SPECIFIED
-                ParDenominator: 9    # 9:16 PAR
-                ParNumerator: 16
+                ParDenominator: 1    # 1:1 square pixels
+                ParNumerator: 1
                 Profile: HIGH
                 QvbrQualityLevel: 8
                 RateControlMode: QVBR
@@ -497,19 +514,52 @@ Resources:
 
         # --- Output groups ---
         OutputGroups:
-          # HLS output to MediaPackage
+          # HLS output to MediaPackage v2 (via ingest URL)
           - Name: MediaPackageGroup
             OutputGroupSettings:
-              MediaPackageGroupSettings:
+              HlsGroupSettings:
                 Destination:
                   DestinationRefId: mediapackage-dest
+                HlsCdnSettings:
+                  HlsWebdavSettings:
+                    ConnectionRetryInterval: 10
+                    FilecacheDuration: 300
+                    HttpTransferMode: NON_CHUNKED
+                    NumRetries: 10
+                    RestartDelay: 15
+                HlsId3SegmentTagging: DISABLED
+                IFrameOnlyPlaylists: DISABLED
+                IndexNSegments: 10
+                InputLossAction: EMIT_OUTPUT
+                ManifestDurationFormat: INTEGER
+                Mode: LIVE
+                OutputSelection: MANIFESTS_AND_SEGMENTS
+                ProgramDateTime: INCLUDE
+                ProgramDateTimePeriod: 600
+                SegmentLength: 2
+                SegmentationMode: USE_SEGMENT_DURATION
+                StreamInfResolution: INCLUDE
+                TimedMetadataId3Frame: PRIV
+                TsFileMode: SEGMENTED_FILES
             Outputs:
               - OutputName: vertical-1080p-hls
                 VideoDescriptionName: video_1080x1920
                 AudioDescriptionNames:
                   - audio_aac_192k
                 OutputSettings:
-                  MediaPackageOutputSettings: {}
+                  HlsOutputSettings:
+                    HlsSettings:
+                      StandardHlsSettings:
+                        AudioRenditionSets: program_audio
+                        M3u8Settings:
+                          AudioFramesPerPes: 4
+                          AudioPids: 492-498
+                          PcrControl: PCR_EVERY_PES_PACKET
+                          PmtPid: "480"
+                          ProgramNum: 1
+                          TimedMetadataBehavior: NO_PASSTHROUGH
+                          VideoPid: "481"
+                    NameModifier: _1
 
           # RTMP output to TikTok LIVE
           - !If
@@ -613,8 +663,8 @@ Resources:
 
       Destinations:
         - Id: mediapackage-dest
-          MediaPackageSettings:
-            - ChannelId: !Sub "${EnvironmentName}-channel"
+          Settings:
+            - Url: !Sub "https://${EnvironmentName}-channel-group.mediapackagev2.${AWS::Region}.amazonaws.com/in/v1/${EnvironmentName}-channel-group/1/${EnvironmentName}-channel/index"
         - !If
           - EnableTikTok
           - Id: tiktok-dest

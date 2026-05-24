@@ -130,7 +130,56 @@ aws mediapackagev2 put-origin-endpoint-policy `
 
 Write-Host "  MediaPackage policy applied" -ForegroundColor Green
 
-# --- Step 7: Summary ---
+# --- Step 7: Fix MediaLive destination URL ---
+Write-Host "[7/9] Fixing MediaLive destination URL to point to MediaPackage v2 ingest..." -ForegroundColor Yellow
+
+# Get the actual ingest URL from MediaPackage v2
+$INGEST_URL = aws mediapackagev2 get-channel `
+  --channel-group-name vertical-video-demo-channel-group `
+  --channel-name vertical-video-demo-channel `
+  --region us-east-1 `
+  --query "IngestEndpoints[0].Url" `
+  --output text
+
+Write-Host "  Ingest URL: $INGEST_URL" -ForegroundColor Green
+
+# Get current MediaLive channel config and update the destination
+$CHANNEL_CONFIG = aws medialive describe-channel --channel-id $CHANNEL_ID --region us-east-1 --output json | ConvertFrom-Json
+
+$CURRENT_DEST_URL = $CHANNEL_CONFIG.Destinations[0].Settings[0].Url
+
+if ($CURRENT_DEST_URL -ne $INGEST_URL) {
+    Write-Host "  Current destination: $CURRENT_DEST_URL" -ForegroundColor Yellow
+    Write-Host "  Updating to: $INGEST_URL" -ForegroundColor Yellow
+
+    # Build the update payload
+    $updatePayload = @{
+        ChannelId = $CHANNEL_ID
+        Destinations = @(
+            @{
+                Id = "mediapackage-dest"
+                Settings = @(
+                    @{ Url = $INGEST_URL }
+                )
+            }
+        )
+    }
+
+    # Add RTMP destinations if they exist
+    for ($i = 1; $i -lt $CHANNEL_CONFIG.Destinations.Count; $i++) {
+        $updatePayload.Destinations += $CHANNEL_CONFIG.Destinations[$i]
+    }
+
+    $updateJson = $updatePayload | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText("$PWD\channel-update.json", $updateJson)
+
+    aws medialive update-channel --cli-input-json file://channel-update.json --region us-east-1 --output text --query "Channel.State" 2>$null | Out-Null
+    Write-Host "  MediaLive destination updated" -ForegroundColor Green
+} else {
+    Write-Host "  Destination already correct" -ForegroundColor Green
+}
+
+# --- Step 8: Summary ---
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host " SETUP COMPLETE" -ForegroundColor Cyan
