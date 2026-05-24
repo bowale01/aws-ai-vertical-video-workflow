@@ -497,6 +497,45 @@ Then manually:
 
 ---
 
+## Demo Results
+
+### AI Smart Crop — 9:16 Vertical Output
+The Elemental Inference AI automatically crops the 16:9 football match to follow the action in 9:16 portrait format:
+
+![MediaLive 9:16 Preview](screenshots/03-smart-crop-preview.png)
+
+### OBS Studio Streaming Live
+Football clip streaming from OBS to AWS MediaLive via RTMP:
+
+![OBS Streaming](screenshots/02-obs-streaming-live.png)
+
+### AWS Elemental Inference — Smart Crop Enabled
+AI-powered smart cropping enabled on the MediaLive channel:
+
+![Elemental Inference Settings](screenshots/04-elemental-inference-settings.png)
+
+### MediaLive Channel Running
+Channel running with 9:16 vertical preview visible:
+
+![MediaLive Channel](screenshots/01-medialive-preview-9x16.png)
+
+### Video Output — 1080x1920 (9:16)
+Encoder configured for 1080 width × 1920 height vertical output:
+
+![Video Description](screenshots/05-video-description-1080x1920.png)
+
+### CloudFormation Stack — All Resources Created
+22 resources deployed successfully via Infrastructure as Code:
+
+![CloudFormation Resources](screenshots/08-cloudformation-resources.png)
+
+### MediaPackage v2 — HLS Endpoint
+Live v2 channel group with operational metrics showing video flow:
+
+![MediaPackage v2](screenshots/12-mediapackage-v2.png)
+
+---
+
 ## References
 
 - [AWS NAB 2026 Demo Guide – Elemental Inference Architecture (p.38)](https://d2mee59kmfnfxw.cloudfront.net/nab2026/images/AWS-NAB-2026-Demo-Guide.pdf)
