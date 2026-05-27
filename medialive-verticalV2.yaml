@@ -1,0 +1,721 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  VOS MediaLive Inference V2 - Complete AI-powered vertical video pipeline.
+  MediaLive + MediaPackage V2 + Elemental Inference + Lambda clipping + S3 + CloudFront.
+  Detects highlights (goals, saves, shots) and clips them automatically.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: vos-medialive-inference
+    Description: Project name used as prefix for all resources
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for clip notifications (optional)
+
+  # Tagging Parameters
+  CostCentre:
+    Type: String
+    Default: '2000920243'
+  BillingTeam:
+    Type: String
+    Default: 'cti'
+  Workflow:
+    Type: String
+    Default: 'oadsde'
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: [dev, preprod, prod]
+  Territory:
+    Type: String
+    Default: 'DE'
+    AllowedValues: [UK, DE, IT]
+  Service:
+    Type: String
+    Default: 'distribution platform'
+  Service2:
+    Type: String
+    Default: 'AWS media inference'
+  Service3:
+    Type: String
+    Default: 'sky'
+  Service4:
+    Type: String
+    Default: 'na'
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+
+  # =============================================================
+  # ELEMENTAL INFERENCE FEED
+  # =============================================================
+  InferenceFeed:
+    Type: AWS::ElementalInference::Feed
+    Properties:
+      Name: !Sub '${ProjectName}-feed'
+      Outputs:
+        - Name: clipping-output
+          Status: ENABLED
+          OutputConfig:
+            Clipping: {}
+      Tags:
+        Project: !Ref ProjectName
+        cost_centre: !Ref CostCentre
+        billing_team: !Ref BillingTeam
+        environment: !Ref Environment
+
+  # =============================================================
+  # MEDIALIVE INPUT
+  # =============================================================
+  MediaLiveInput:
+    Type: AWS::MediaLive::Input
+    Properties:
+      Name: !Sub '${ProjectName}-input'
+      Type: SRT_CALLER
+      SrtSettings:
+        SrtCallerSources:
+          - SrtListenerAddress: 185.26.141.7
+            SrtListenerPort: '20003'
+            Decryption:
+              Algorithm: AES256
+              PassphraseSecretArn: 'arn:aws:secretsmanager:eu-west-1:256658342820:secret:srt-passphrase-MMonNn'
+      Tags:
+        Project: !Ref ProjectName
+        cost_centre: !Ref CostCentre
+        billing_team: !Ref BillingTeam
+        workflow: !Ref Workflow
+        environment: !Ref Environment
+        territory: !Ref Territory
+
+  # =============================================================
+  # MEDIAPACKAGE V2
+  # =============================================================
+  MediaPackageV2ChannelGroup:
+    Type: AWS::MediaPackageV2::ChannelGroup
+    Properties:
+      ChannelGroupName: !Sub '${ProjectName}-channel-group'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: cost_centre
+          Value: !Ref CostCentre
+        - Key: environment
+          Value: !Ref Environment
+
+  MediaPackageV2Channel:
+    Type: AWS::MediaPackageV2::Channel
+    Properties:
+      ChannelGroupName: !Sub '${ProjectName}-channel-group'
+      ChannelName: !Sub '${ProjectName}-channel'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: cost_centre
+          Value: !Ref CostCentre
+        - Key: environment
+          Value: !Ref Environment
+    DependsOn: MediaPackageV2ChannelGroup
+
+  MediaPackageV2OriginEndpoint:
+    Type: AWS::MediaPackageV2::OriginEndpoint
+    Properties:
+      ChannelGroupName: !Sub '${ProjectName}-channel-group'
+      ChannelName: !Sub '${ProjectName}-channel'
+      OriginEndpointName: !Sub '${ProjectName}-hls-endpoint'
+      ContainerType: TS
+      StartoverWindowSeconds: 900
+      HlsManifests:
+        - ManifestName: index
+          ManifestWindowSeconds: 60
+          ProgramDateTimeIntervalSeconds: 1
+      Segment:
+        SegmentDurationSeconds: 6
+        SegmentName: seg
+        TsIncludeDvbSubtitles: false
+        TsUseAudioRenditionGroup: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: cost_centre
+          Value: !Ref CostCentre
+        - Key: environment
+          Value: !Ref Environment
+    DependsOn: MediaPackageV2Channel
+
+  MediaPackageV2EndpointPolicy:
+    Type: AWS::MediaPackageV2::OriginEndpointPolicy
+    Properties:
+      ChannelGroupName: !Sub '${ProjectName}-channel-group'
+      ChannelName: !Sub '${ProjectName}-channel'
+      OriginEndpointName: !Sub '${ProjectName}-hls-endpoint'
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublicRead
+            Effect: Allow
+            Principal: '*'
+            Action: mediapackagev2:GetObject
+            Resource: !GetAtt MediaPackageV2OriginEndpoint.Arn
+    DependsOn: MediaPackageV2OriginEndpoint
+
+  # =============================================================
+  # MEDIALIVE CHANNEL
+  # =============================================================
+  MediaLiveChannel:
+    Type: AWS::MediaLive::Channel
+    DependsOn: MediaPackageV2OriginEndpoint
+    Properties:
+      Name: !Sub '${ProjectName}-channel'
+      RoleArn: 'arn:aws:iam::256658342820:role/MediaLiveAccessRole'
+      ChannelClass: SINGLE_PIPELINE
+      InputAttachments:
+        - InputId: !Ref MediaLiveInput
+          InputAttachmentName: primary-input
+          InputSettings:
+            SourceEndBehavior: CONTINUE
+            InputFilter: AUTO
+            FilterStrength: 1
+            DeblockFilter: DISABLED
+            DenoiseFilter: DISABLED
+      Destinations:
+        - Id: mediapackagev2-destination
+          Settings:
+            - Url: !Select [0, !GetAtt MediaPackageV2Channel.IngestEndpointUrls]
+      EncoderSettings:
+        TimecodeConfig:
+          Source: EMBEDDED
+        AudioDescriptions:
+          - Name: audio_1
+            AudioSelectorName: default
+            AudioTypeControl: FOLLOW_INPUT
+            LanguageCodeControl: FOLLOW_INPUT
+            CodecSettings:
+              AacSettings:
+                Bitrate: 192000
+                CodingMode: CODING_MODE_2_0
+                InputType: NORMAL
+                Profile: LC
+                RateControlMode: CBR
+                RawFormat: NONE
+                SampleRate: 48000
+                Spec: MPEG4
+        VideoDescriptions:
+          - Name: video_vertical_1080
+            Width: 1080
+            Height: 1920
+            RespondToAfd: NONE
+            Sharpness: 50
+            ScalingBehavior: SMART_CROP
+            CodecSettings:
+              H264Settings:
+                AdaptiveQuantization: "OFF"
+                AfdSignaling: NONE
+                Bitrate: 8000000
+                ColorMetadata: INSERT
+                EntropyEncoding: CABAC
+                FlickerAq: DISABLED
+                ForceFieldPictures: DISABLED
+                FramerateControl: SPECIFIED
+                FramerateNumerator: 25
+                FramerateDenominator: 1
+                GopBReference: ENABLED
+                GopClosedCadence: 1
+                GopNumBFrames: 3
+                GopSize: 48
+                GopSizeUnits: FRAMES
+                Level: H264_LEVEL_4_1
+                LookAheadRateControl: HIGH
+                NumRefFrames: 3
+                ParControl: SPECIFIED
+                ParNumerator: 9
+                ParDenominator: 16
+                Profile: HIGH
+                RateControlMode: CBR
+                ScanType: PROGRESSIVE
+                SceneChangeDetect: DISABLED
+                SpatialAq: DISABLED
+                SubgopLength: FIXED
+                Syntax: DEFAULT
+                TemporalAq: DISABLED
+                TimecodeInsertion: DISABLED
+        OutputGroups:
+          - Name: HLSGroup
+            OutputGroupSettings:
+              HlsGroupSettings:
+                Destination:
+                  DestinationRefId: mediapackagev2-destination
+                HlsCdnSettings:
+                  HlsBasicPutSettings:
+                    NumRetries: 10
+                    ConnectionRetryInterval: 1
+                SegmentLength: 6
+                MinSegmentLength: 0
+            Outputs:
+              - OutputName: vertical-output
+                VideoDescriptionName: video_vertical_1080
+                AudioDescriptionNames:
+                  - audio_1
+                OutputSettings:
+                  HlsOutputSettings:
+                    NameModifier: '_1'
+                    HlsSettings:
+                      StandardHlsSettings:
+                        M3u8Settings:
+                          AudioFramesPerPes: 4
+                          PcrControl: PCR_EVERY_PES_PACKET
+      InferenceSettings:
+        FeedArn: !GetAtt InferenceFeed.Arn
+      InputSpecification:
+        Codec: AVC
+        MaximumBitrate: MAX_50_MBPS
+        Resolution: HD
+      Tags:
+        Project: !Ref ProjectName
+        cost_centre: !Ref CostCentre
+        billing_team: !Ref BillingTeam
+        workflow: !Ref Workflow
+        environment: !Ref Environment
+        territory: !Ref Territory
+        service: !Ref Service
+        service2: !Ref Service2
+        service3: !Ref Service3
+        service4: !Ref Service4
+
+  # =============================================================
+  # S3 BUCKET FOR CLIPS
+  # =============================================================
+  ClipOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-clips-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldClips
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: cost_centre
+          Value: !Ref CostCentre
+        - Key: billing_team
+          Value: !Ref BillingTeam
+        - Key: environment
+          Value: !Ref Environment
+
+  ClipBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ClipOutputBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ClipOutputBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # =============================================================
+  # LAMBDA - HIGHLIGHT CLIP PROCESSOR
+  # =============================================================
+  ClipLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-clip-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClipAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ClipOutputBucket.Arn
+                  - !Sub '${ClipOutputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ClipNotificationTopic
+
+  ClipProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-clip-processor'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt ClipLambdaRole.Arn
+      Environment:
+        Variables:
+          CLIP_BUCKET: !Ref ClipOutputBucket
+          ENDPOINT_URL: !Select [0, !GetAtt MediaPackageV2OriginEndpoint.HlsManifestUrls]
+          SNS_TOPIC_ARN: !Ref ClipNotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              """
+              Processes Elemental Inference 'Clip Metadata Generated' events.
+              Uses MediaPackage V2 time-shifted playback to fetch the exact
+              highlight moment and stores it in S3.
+              """
+              print(f"Received event: {json.dumps(event)}")
+              
+              detail = event.get('detail', {})
+              timescale = detail.get('timescale', 90000)
+              start_pts = detail.get('startPts', 0)
+              end_pts = detail.get('endPts', 0)
+              tags = detail.get('tags', [])
+              event_time = event.get('time', '')
+              
+              # Calculate clip duration from AI-provided PTS
+              duration_seconds = (end_pts - start_pts) / timescale
+              buffer_before = 15
+              buffer_after = 12
+              
+              print(f"AI detected: {tags}, duration: {duration_seconds}s")
+              
+              # Wait 10 seconds so "after" segments exist in MediaPackage
+              import time
+              time.sleep(10)
+              
+              # Calculate time window
+              if event_time:
+                  detection_time = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
+              else:
+                  detection_time = datetime.now(timezone.utc)
+              
+              start_time = detection_time - timedelta(seconds=duration_seconds + buffer_before)
+              end_time = detection_time + timedelta(seconds=buffer_after)
+              
+              # Format for MediaPackage V2 time-shifted playback
+              start_iso = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+              end_iso = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+              
+              print(f"Fetching clip from {start_iso} to {end_iso}")
+              
+              # Create unique clip ID
+              tag_str = '-'.join(tags) if tags else 'highlight'
+              timestamp_str = detection_time.strftime('%Y%m%d-%H%M%S')
+              clip_id = f"{tag_str}-{timestamp_str}"
+              
+              # Build MediaPackage V2 time-shifted URL
+              endpoint_url = os.environ['ENDPOINT_URL']
+              base_endpoint = endpoint_url.split('?')[0]
+              # V2 format: ?aws.manifestsettings=start:<epoch>;end:<epoch>
+              start_epoch = int(start_time.timestamp())
+              end_epoch = int(end_time.timestamp())
+              time_shifted_url = f"{base_endpoint}?start={start_iso}&end={end_iso}"
+              
+              bucket = os.environ['CLIP_BUCKET']
+              
+              try:
+                  # Time-shifted only (no fallback) - testing V2 support
+                  print(f"Fetching time-shifted manifest: {time_shifted_url}")
+                  req = urllib.request.Request(time_shifted_url)
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      manifest_content = response.read().decode('utf-8')
+                  
+                  print(f"Manifest fetched, length: {len(manifest_content)}")
+                  
+                  # Parse manifest
+                  base_url = base_endpoint.rsplit('/', 1)[0] + '/'
+                  lines = manifest_content.strip().split('\n')
+                  
+                  # Check if master playlist
+                  is_master = any('#EXT-X-STREAM-INF' in line for line in lines)
+                  
+                  if is_master:
+                      variant_url = None
+                      for i, line in enumerate(lines):
+                          if '#EXT-X-STREAM-INF' in line and i + 1 < len(lines):
+                              variant_url = lines[i + 1].strip()
+                              if not variant_url.startswith('http'):
+                                  variant_url = base_url + variant_url
+                              break
+                      
+                      if not variant_url:
+                          raise Exception("No variant playlist found")
+                      
+                      print(f"Fetching variant: {variant_url}")
+                      req = urllib.request.Request(variant_url)
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          manifest_content = response.read().decode('utf-8')
+                      
+                      base_url = variant_url.rsplit('/', 1)[0] + '/'
+                      lines = manifest_content.strip().split('\n')
+                  
+                  # Parse segments
+                  segment_list = []
+                  for i, line in enumerate(lines):
+                      if line.startswith('#EXTINF:'):
+                          dur = float(line.split(':')[1].rstrip(','))
+                          if i + 1 < len(lines):
+                              seg_url = lines[i + 1].strip()
+                              if seg_url.startswith('#'):
+                                  continue
+                              if not seg_url.startswith('http'):
+                                  seg_url = base_url + seg_url
+                              segment_list.append({'url': seg_url, 'duration': dur})
+                  
+                  # Select segments covering clip duration
+                  total_needed = duration_seconds + buffer_before + buffer_after
+                  selected_segments = []
+                  collected_duration = 0
+                  for seg in reversed(segment_list):
+                      selected_segments.insert(0, seg)
+                      collected_duration += seg['duration']
+                      if collected_duration >= total_needed:
+                          break
+                  
+                  print(f"Selected {len(selected_segments)} segments, duration: {collected_duration}s")
+                  
+                  if not selected_segments:
+                      raise Exception("No segments found")
+                  
+                  # Download and upload segments
+                  clip_prefix = f"clips/{clip_id}"
+                  segment_files = []
+                  
+                  for idx, seg in enumerate(selected_segments):
+                      seg_filename = f"segment_{idx:04d}.ts"
+                      print(f"Downloading segment {idx}/{len(selected_segments)}")
+                      
+                      req = urllib.request.Request(seg['url'])
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          seg_data = response.read()
+                      
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=f"{clip_prefix}/{seg_filename}",
+                          Body=seg_data,
+                          ContentType='video/MP2T'
+                      )
+                      segment_files.append({'filename': seg_filename, 'duration': seg['duration']})
+                  
+                  # Create VOD manifest
+                  clip_manifest = "#EXTM3U\n#EXT-X-VERSION:3\n"
+                  clip_manifest += f"#EXT-X-TARGETDURATION:{int(max(s['duration'] for s in segment_files)) + 1}\n"
+                  clip_manifest += "#EXT-X-MEDIA-SEQUENCE:0\n"
+                  clip_manifest += "#EXT-X-PLAYLIST-TYPE:VOD\n"
+                  for seg in segment_files:
+                      clip_manifest += f"#EXTINF:{seg['duration']:.6f},\n{seg['filename']}\n"
+                  clip_manifest += "#EXT-X-ENDLIST\n"
+                  
+                  manifest_key = f"{clip_prefix}/index.m3u8"
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key=manifest_key,
+                      Body=clip_manifest.encode('utf-8'),
+                      ContentType='application/vnd.apple.mpegurl'
+                  )
+                  
+                  total_duration = sum(s['duration'] for s in segment_files)
+                  print(f"Clip saved: s3://{bucket}/{manifest_key} ({len(segment_files)} segments, {total_duration:.1f}s)")
+                  
+                  # Notify
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=f"Highlight: {tag_str}",
+                      Message=json.dumps({
+                          'event': tag_str,
+                          'clipId': clip_id,
+                          'bucket': bucket,
+                          'manifestKey': manifest_key,
+                          'segments': len(segment_files),
+                          'duration': f"{total_duration:.1f}s",
+                          'status': 'CLIP_SAVED'
+                      }, indent=2)
+                  )
+                  
+                  return {'statusCode': 200, 'clipId': clip_id, 'duration': total_duration}
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise
+
+  # =============================================================
+  # EVENTBRIDGE - HIGHLIGHT DETECTION
+  # =============================================================
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ClipProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HighlightDetectionRule.Arn
+
+  HighlightDetectionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-highlight-rule'
+      Description: Triggers clipping when AI detects a highlight
+      EventPattern:
+        source:
+          - aws.elemental-inference
+        detail-type:
+          - Clip Metadata Generated
+      State: ENABLED
+      Targets:
+        - Id: ClipProcessor
+          Arn: !GetAtt ClipProcessorFunction.Arn
+
+  # =============================================================
+  # SNS NOTIFICATIONS
+  # =============================================================
+  ClipNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-clip-notifications'
+
+  ClipNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref ClipNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =============================================================
+  # CLOUDFRONT - CDN FOR CLIPS
+  # =============================================================
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} - Clip delivery'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultCacheBehavior:
+          TargetOriginId: S3Clips
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+        Origins:
+          - Id: S3Clips
+            DomainName: !GetAtt ClipOutputBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: cost_centre
+          Value: !Ref CostCentre
+        - Key: environment
+          Value: !Ref Environment
+
+  # =============================================================
+  # CLOUDWATCH ALARM
+  # =============================================================
+  MediaLiveInputLossAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-input-loss'
+      AlarmDescription: MediaLive channel has lost input signal
+      Namespace: AWS/MediaLive
+      MetricName: InputLossSeconds
+      Dimensions:
+        - Name: ChannelId
+          Value: !Ref MediaLiveChannel
+        - Name: Pipeline
+          Value: '0'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasNotificationEmail
+        - [!Ref ClipNotificationTopic]
+        - []
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+  MediaLiveChannelId:
+    Description: MediaLive Channel ID
+    Value: !Ref MediaLiveChannel
+
+  MediaPackageV2EndpointUrl:
+    Description: MediaPackage V2 HLS endpoint URL
+    Value: !Select [0, !GetAtt MediaPackageV2OriginEndpoint.HlsManifestUrls]
+
+  ClipBucketName:
+    Description: S3 bucket for highlight clips
+    Value: !Ref ClipOutputBucket
+
+  CloudFrontDomain:
+    Description: CloudFront domain for clip playback
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  InferenceFeedArn:
+    Description: Elemental Inference Feed ARN
+    Value: !GetAtt InferenceFeed.Arn
+
+  LambdaFunction:
+    Description: Clip processor Lambda
+    Value: !Ref ClipProcessorFunction

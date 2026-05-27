@@ -383,18 +383,35 @@ Resources:
       ContainerType: TS
       HlsManifests:
         - ManifestName: index
-          ManifestWindowSeconds: 30
-          ProgramDateTimeIntervalSeconds: 60
-          ScteHls:
-            AdMarkerHls: DATERANGE
+          ManifestWindowSeconds: 60
+          ProgramDateTimeIntervalSeconds: 1
       Segment:
-        SegmentDurationSeconds: !Ref HlsSegmentDuration
-        SegmentName: segment
+        SegmentDurationSeconds: 6
+        SegmentName: seg
         TsUseAudioRenditionGroup: false
         IncludeIframeOnlyStreams: false
       Tags:
         - Key: Name
           Value: !Sub "${EnvironmentName}-hls-endpoint"
+
+  # -------------------------------------------------------------------------
+  # MediaPackage v2 – Endpoint Policy (allows public read for playback)
+  # -------------------------------------------------------------------------
+  MediaPackageEndpointPolicy:
+    Type: AWS::MediaPackageV2::OriginEndpointPolicy
+    DependsOn: MediaPackageHlsEndpoint
+    Properties:
+      ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
+      ChannelName: !Sub "${EnvironmentName}-channel"
+      OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowPublicRead
+            Effect: Allow
+            Principal: '*'
+            Action: mediapackagev2:GetObject
+            Resource: !GetAtt MediaPackageHlsEndpoint.Arn
 
   # -------------------------------------------------------------------------
   # Elemental Inference – Feed for AI smart cropping
@@ -484,8 +501,8 @@ Resources:
                 MinIInterval: 0
                 NumRefFrames: 3
                 ParControl: SPECIFIED
-                ParDenominator: 1    # 1:1 square pixels
-                ParNumerator: 1
+                ParDenominator: 16
+                ParNumerator: 9
                 Profile: HIGH
                 QvbrQualityLevel: 8
                 RateControlMode: QVBR
@@ -521,26 +538,11 @@ Resources:
                 Destination:
                   DestinationRefId: mediapackage-dest
                 HlsCdnSettings:
-                  HlsWebdavSettings:
-                    ConnectionRetryInterval: 10
-                    FilecacheDuration: 300
-                    HttpTransferMode: NON_CHUNKED
+                  HlsBasicPutSettings:
                     NumRetries: 10
-                    RestartDelay: 15
-                HlsId3SegmentTagging: DISABLED
-                IFrameOnlyPlaylists: DISABLED
-                IndexNSegments: 10
-                InputLossAction: EMIT_OUTPUT
-                ManifestDurationFormat: INTEGER
-                Mode: LIVE
-                OutputSelection: MANIFESTS_AND_SEGMENTS
-                ProgramDateTime: INCLUDE
-                ProgramDateTimePeriod: 600
-                SegmentLength: 2
-                SegmentationMode: USE_SEGMENT_DURATION
-                StreamInfResolution: INCLUDE
-                TimedMetadataId3Frame: PRIV
-                TsFileMode: SEGMENTED_FILES
+                    ConnectionRetryInterval: 1
+                SegmentLength: 6
+                MinSegmentLength: 0
             Outputs:
               - OutputName: vertical-1080p-hls
                 VideoDescriptionName: video_1080x1920
@@ -548,18 +550,12 @@ Resources:
                   - audio_aac_192k
                 OutputSettings:
                   HlsOutputSettings:
+                    NameModifier: _1
                     HlsSettings:
                       StandardHlsSettings:
-                        AudioRenditionSets: program_audio
                         M3u8Settings:
                           AudioFramesPerPes: 4
-                          AudioPids: 492-498
                           PcrControl: PCR_EVERY_PES_PACKET
-                          PmtPid: "480"
-                          ProgramNum: 1
-                          TimedMetadataBehavior: NO_PASSTHROUGH
-                          VideoPid: "481"
-                    NameModifier: _1
 
           # RTMP output to TikTok LIVE
           - !If
@@ -664,7 +660,7 @@ Resources:
       Destinations:
         - Id: mediapackage-dest
           Settings:
-            - Url: !Sub "https://${EnvironmentName}-channel-group.mediapackagev2.${AWS::Region}.amazonaws.com/in/v1/${EnvironmentName}-channel-group/1/${EnvironmentName}-channel/index"
+            - Url: !Select [0, !GetAtt MediaPackageChannel.IngestEndpointUrls]
         - !If
           - EnableTikTok
           - Id: tiktok-dest
@@ -1023,8 +1019,8 @@ Outputs:
       Name: !Sub "${EnvironmentName}-mp-channel"
 
   HlsPlaybackUrl:
-    Description: CloudFront HLS playback URL (append /index.m3u8 path from MediaPackage endpoint)
-    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Description: MediaPackage V2 HLS endpoint URL (direct playback)
+    Value: !Select [0, !GetAtt MediaPackageHlsEndpoint.HlsManifestUrls]
     Export:
       Name: !Sub "${EnvironmentName}-playback-url"
 
