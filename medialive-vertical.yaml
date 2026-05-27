@@ -230,92 +230,38 @@ Resources:
                   - !Sub "arn:aws:s3:::${EnvironmentName}-live-archive-${AWS::AccountId}/*"
 
   # -------------------------------------------------------------------------
-  # IAM – MediaConvert role
+  # IAM – Lambda role for highlight clip processing
   # -------------------------------------------------------------------------
-  MediaConvertRole:
+  ClipLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${EnvironmentName}-mediaconvert-role"
+      RoleName: !Sub "${EnvironmentName}-clip-lambda-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: mediaconvert.amazonaws.com
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: MediaConvertPolicy
+        - PolicyName: ClipAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:GetObject
                   - s3:PutObject
+                  - s3:GetObject
                   - s3:ListBucket
                 Resource:
-                  - !Sub "arn:aws:s3:::${ClipsBucket}"
-                  - !Sub "arn:aws:s3:::${ClipsBucket}/*"
-
-  # -------------------------------------------------------------------------
-  # IAM – Step Functions role
-  # -------------------------------------------------------------------------
-  StepFunctionsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${EnvironmentName}-stepfunctions-role"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: states.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: StepFunctionsPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
+                  - !GetAtt ClipsBucket.Arn
+                  - !Sub "${ClipsBucket.Arn}/*"
               - Effect: Allow
                 Action:
-                  - mediapackagev2:CreateHarvestJob
-                  - mediapackagev2:GetHarvestJob
-                  - mediaconvert:CreateJob
-                  - mediaconvert:GetJob
-                  - s3:PutObject
-                  - s3:GetObject
-                  - logs:CreateLogDelivery
-                  - logs:GetLogDelivery
-                  - logs:UpdateLogDelivery
-                  - logs:DeleteLogDelivery
-                  - logs:ListLogDeliveries
-                  - logs:PutResourcePolicy
-                  - logs:DescribeResourcePolicies
-                  - logs:DescribeLogGroups
-                Resource: "*"
-
-  # -------------------------------------------------------------------------
-  # IAM – EventBridge role (to trigger Step Functions)
-  # -------------------------------------------------------------------------
-  EventBridgeRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${EnvironmentName}-eventbridge-role"
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: events.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: EventBridgeStartSFN
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: states:StartExecution
-                Resource: !Ref HighlightClipStateMachine
+                  - sns:Publish
+                Resource: !Ref ClipNotificationTopic
 
   # -------------------------------------------------------------------------
   # MediaLive – Input Security Group (allow SRT from anywhere for demo)
@@ -381,6 +327,7 @@ Resources:
       ChannelName: !Sub "${EnvironmentName}-channel"
       OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
       ContainerType: TS
+      StartoverWindowSeconds: 900
       HlsManifests:
         - ManifestName: index
           ManifestWindowSeconds: 60
@@ -783,202 +730,164 @@ Resources:
           Value: !Sub "${EnvironmentName}-distribution"
 
   # -------------------------------------------------------------------------
-  # EventBridge – Rule triggered by Elemental Inference highlight events
+  # Lambda – Highlight clip processor (time-shifted playback from MediaPackage)
   # -------------------------------------------------------------------------
-  InferenceHighlightRule:
+  ClipProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-clip-processor"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt ClipLambdaRole.Arn
+      Environment:
+        Variables:
+          CLIP_BUCKET: !Ref ClipsBucket
+          ENDPOINT_URL: !Select [0, !GetAtt MediaPackageHlsEndpoint.HlsManifestUrls]
+          SNS_TOPIC_ARN: !Ref ClipNotificationTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              detail = event.get('detail', {})
+              timescale = detail.get('timescale', 90000)
+              start_pts = detail.get('startPts', 0)
+              end_pts = detail.get('endPts', 0)
+              tags = detail.get('tags', [])
+              event_time = event.get('time', '')
+              duration_seconds = (end_pts - start_pts) / timescale
+              buffer_before = 15
+              buffer_after = 12
+              print(f"AI detected: {tags}, duration: {duration_seconds}s")
+              import time
+              time.sleep(10)
+              if event_time:
+                  detection_time = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
+              else:
+                  detection_time = datetime.now(timezone.utc)
+              start_time = detection_time - timedelta(seconds=duration_seconds + buffer_before)
+              end_time = detection_time + timedelta(seconds=buffer_after)
+              start_iso = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+              end_iso = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+              tag_str = '-'.join(tags) if tags else 'highlight'
+              timestamp_str = detection_time.strftime('%Y%m%d-%H%M%S')
+              clip_id = f"{tag_str}-{timestamp_str}"
+              endpoint_url = os.environ['ENDPOINT_URL']
+              base_endpoint = endpoint_url.split('?')[0]
+              time_shifted_url = f"{base_endpoint}?start={start_iso}&end={end_iso}"
+              bucket = os.environ['CLIP_BUCKET']
+              try:
+                  req = urllib.request.Request(time_shifted_url)
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      manifest_content = response.read().decode('utf-8')
+                  base_url = base_endpoint.rsplit('/', 1)[0] + '/'
+                  lines = manifest_content.strip().split('\n')
+                  is_master = any('#EXT-X-STREAM-INF' in line for line in lines)
+                  if is_master:
+                      variant_url = None
+                      for i, line in enumerate(lines):
+                          if '#EXT-X-STREAM-INF' in line and i + 1 < len(lines):
+                              variant_url = lines[i + 1].strip()
+                              if not variant_url.startswith('http'):
+                                  variant_url = base_url + variant_url
+                              break
+                      if not variant_url:
+                          raise Exception("No variant playlist found")
+                      req = urllib.request.Request(variant_url)
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          manifest_content = response.read().decode('utf-8')
+                      base_url = variant_url.rsplit('/', 1)[0] + '/'
+                      lines = manifest_content.strip().split('\n')
+                  segment_list = []
+                  for i, line in enumerate(lines):
+                      if line.startswith('#EXTINF:'):
+                          dur = float(line.split(':')[1].rstrip(','))
+                          if i + 1 < len(lines):
+                              seg_url = lines[i + 1].strip()
+                              if seg_url.startswith('#'):
+                                  continue
+                              if not seg_url.startswith('http'):
+                                  seg_url = base_url + seg_url
+                              segment_list.append({'url': seg_url, 'duration': dur})
+                  total_needed = duration_seconds + buffer_before + buffer_after
+                  selected_segments = []
+                  collected_duration = 0
+                  for seg in reversed(segment_list):
+                      selected_segments.insert(0, seg)
+                      collected_duration += seg['duration']
+                      if collected_duration >= total_needed:
+                          break
+                  if not selected_segments:
+                      raise Exception("No segments found")
+                  clip_prefix = f"clips/{clip_id}"
+                  segment_files = []
+                  for idx, seg in enumerate(selected_segments):
+                      seg_filename = f"segment_{idx:04d}.ts"
+                      req = urllib.request.Request(seg['url'])
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          seg_data = response.read()
+                      s3.put_object(Bucket=bucket, Key=f"{clip_prefix}/{seg_filename}", Body=seg_data, ContentType='video/MP2T')
+                      segment_files.append({'filename': seg_filename, 'duration': seg['duration']})
+                  clip_manifest = "#EXTM3U\n#EXT-X-VERSION:3\n"
+                  clip_manifest += f"#EXT-X-TARGETDURATION:{int(max(s['duration'] for s in segment_files)) + 1}\n"
+                  clip_manifest += "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+                  for seg in segment_files:
+                      clip_manifest += f"#EXTINF:{seg['duration']:.6f},\n{seg['filename']}\n"
+                  clip_manifest += "#EXT-X-ENDLIST\n"
+                  manifest_key = f"{clip_prefix}/index.m3u8"
+                  s3.put_object(Bucket=bucket, Key=manifest_key, Body=clip_manifest.encode('utf-8'), ContentType='application/vnd.apple.mpegurl')
+                  total_duration = sum(s['duration'] for s in segment_files)
+                  print(f"Clip saved: s3://{bucket}/{manifest_key} ({len(segment_files)} segments, {total_duration:.1f}s)")
+                  sns.publish(TopicArn=os.environ['SNS_TOPIC_ARN'], Subject=f"Highlight: {tag_str}",
+                      Message=json.dumps({'event': tag_str, 'clipId': clip_id, 'bucket': bucket, 'manifestKey': manifest_key, 'segments': len(segment_files), 'duration': f"{total_duration:.1f}s"}, indent=2))
+                  return {'statusCode': 200, 'clipId': clip_id, 'duration': total_duration}
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise
+
+  # -------------------------------------------------------------------------
+  # EventBridge – Triggered when Elemental Inference detects a highlight
+  # -------------------------------------------------------------------------
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ClipProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HighlightDetectionRule.Arn
+
+  HighlightDetectionRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub "${EnvironmentName}-inference-highlight"
-      Description: Triggered when Elemental Inference detects a highlight moment
+      Name: !Sub "${EnvironmentName}-highlight-rule"
+      Description: Triggers clipping when AI detects a highlight
       EventPattern:
         source:
           - aws.elemental-inference
         detail-type:
-          - "Elemental Inference Highlight Detected"
-        detail:
-          channelArn:
-            - !Sub "arn:aws:medialive:${AWS::Region}:${AWS::AccountId}:channel:${MediaLiveChannel}"
+          - Clip Metadata Generated
       State: ENABLED
       Targets:
-        - Id: TriggerHighlightSFN
-          Arn: !Ref HighlightClipStateMachine
-          RoleArn: !GetAtt EventBridgeRole.Arn
+        - Id: ClipProcessor
+          Arn: !GetAtt ClipProcessorFunction.Arn
 
   # -------------------------------------------------------------------------
-  # Step Functions – Highlight clip state machine
-  # Triggered by EventBridge when Inference detects a key moment.
-  # 1. Creates a MediaPackage harvest job to extract the clip segment
-  # 2. Waits for harvest to complete
-  # 3. Submits a MediaConvert job to produce MP4 + HLS VOD assets
+  # SNS – Clip notifications
   # -------------------------------------------------------------------------
-  HighlightClipStateMachine:
-    Type: AWS::StepFunctions::StateMachine
+  ClipNotificationTopic:
+    Type: AWS::SNS::Topic
     Properties:
-      StateMachineName: !Sub "${EnvironmentName}-highlight-clip"
-      RoleArn: !GetAtt StepFunctionsRole.Arn
-      Definition:
-        Comment: Harvest highlight clip from MediaPackage and transcode with MediaConvert
-        StartAt: CreateHarvestJob
-        States:
-
-          CreateHarvestJob:
-            Type: Task
-            Resource: arn:aws:states:::aws-sdk:mediapackagev2:createHarvestJob
-            Parameters:
-              ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
-              ChannelName: !Sub "${EnvironmentName}-channel"
-              OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
-              HarvestJobName.$: "States.Format('harvest-{}', $$.Execution.Name)"
-              HarvestedManifests:
-                HlsManifests:
-                  - ManifestName: index
-              ScheduleConfiguration:
-                StartTime.$: "$.detail.startTime"
-                EndTime.$: "$.detail.endTime"
-              Destination:
-                S3Destination:
-                  BucketName: !Ref ClipsBucket
-                  DestinationPath: "harvested/"
-            ResultPath: "$.harvestJob"
-            Next: WaitForHarvest
-
-          WaitForHarvest:
-            Type: Wait
-            Seconds: 30
-            Next: CheckHarvestStatus
-
-          CheckHarvestStatus:
-            Type: Task
-            Resource: arn:aws:states:::aws-sdk:mediapackagev2:getHarvestJob
-            Parameters:
-              ChannelGroupName: !Sub "${EnvironmentName}-channel-group"
-              ChannelName: !Sub "${EnvironmentName}-channel"
-              OriginEndpointName: !Sub "${EnvironmentName}-hls-endpoint"
-              HarvestJobName.$: "$.harvestJob.HarvestJob.HarvestJobName"
-            ResultPath: "$.harvestStatus"
-            Next: IsHarvestComplete
-
-          IsHarvestComplete:
-            Type: Choice
-            Choices:
-              - Variable: "$.harvestStatus.HarvestJob.Status"
-                StringEquals: COMPLETED
-                Next: SubmitMediaConvertJob
-              - Variable: "$.harvestStatus.HarvestJob.Status"
-                StringEquals: FAILED
-                Next: HarvestFailed
-            Default: WaitForHarvest
-
-          SubmitMediaConvertJob:
-            Type: Task
-            Resource: arn:aws:states:::aws-sdk:mediaconvert:createJob
-            Parameters:
-              Role: !GetAtt MediaConvertRole.Arn
-              Settings:
-                Inputs:
-                  - FileInput.$: >-
-                      States.Format('s3://{}/harvested/{}.m3u8',
-                        '${ClipsBucket}',
-                        $.harvestJob.HarvestJob.HarvestJobName)
-                    AudioSelectors:
-                      Audio Selector 1:
-                        DefaultSelection: DEFAULT
-                    VideoSelector: {}
-                    TimecodeSource: ZEROBASED
-                OutputGroups:
-                  # MP4 output
-                  - Name: MP4Output
-                    OutputGroupSettings:
-                      Type: FILE_GROUP_SETTINGS
-                      FileGroupSettings:
-                        Destination.$: >-
-                          States.Format('s3://{}/clips/{}/',
-                            '${ClipsBucket}',
-                            $.harvestJob.HarvestJob.HarvestJobName)
-                    Outputs:
-                      - NameModifier: _1080x1920
-                        ContainerSettings:
-                          Container: MP4
-                          Mp4Settings:
-                            CslgAtom: INCLUDE
-                            FreeSpaceBox: EXCLUDE
-                            MoovPlacement: PROGRESSIVE_DOWNLOAD
-                        VideoDescription:
-                          Width: 1080
-                          Height: 1920
-                          CodecSettings:
-                            Codec: H_264
-                            H264Settings:
-                              Bitrate: 6000000
-                              RateControlMode: QVBR
-                              QvbrSettings:
-                                QvbrQualityLevel: 8
-                              CodecProfile: HIGH
-                              CodecLevel: LEVEL_4_1
-                              FramerateControl: SPECIFIED
-                              FramerateNumerator: 30
-                              FramerateDenominator: 1
-                              GopSize: 60
-                              GopSizeUnits: FRAMES
-                              SceneChangeDetect: ENABLED
-                        AudioDescriptions:
-                          - CodecSettings:
-                              Codec: AAC
-                              AacSettings:
-                                Bitrate: 192000
-                                CodingMode: CODING_MODE_2_0
-                                SampleRate: 48000
-                  # HLS VOD output
-                  - Name: HLSOutput
-                    OutputGroupSettings:
-                      Type: HLS_GROUP_SETTINGS
-                      HlsGroupSettings:
-                        Destination.$: >-
-                          States.Format('s3://{}/clips/{}/hls/',
-                            '${ClipsBucket}',
-                            $.harvestJob.HarvestJob.HarvestJobName)
-                        SegmentLength: 6
-                        MinSegmentLength: 0
-                    Outputs:
-                      - NameModifier: _1080x1920
-                        ContainerSettings:
-                          Container: M3U8
-                        VideoDescription:
-                          Width: 1080
-                          Height: 1920
-                          CodecSettings:
-                            Codec: H_264
-                            H264Settings:
-                              Bitrate: 6000000
-                              RateControlMode: QVBR
-                              QvbrSettings:
-                                QvbrQualityLevel: 8
-                              FramerateControl: SPECIFIED
-                              FramerateNumerator: 30
-                              FramerateDenominator: 1
-                              GopSize: 60
-                              GopSizeUnits: FRAMES
-                        AudioDescriptions:
-                          - CodecSettings:
-                              Codec: AAC
-                              AacSettings:
-                                Bitrate: 192000
-                                CodingMode: CODING_MODE_2_0
-                                SampleRate: 48000
-            ResultPath: "$.mediaConvertJob"
-            Next: ClipComplete
-
-          ClipComplete:
-            Type: Succeed
-
-          HarvestFailed:
-            Type: Fail
-            Error: HarvestJobFailed
-            Cause: MediaPackage harvest job did not complete successfully
-
-      Tags:
-        - Key: Name
-          Value: !Sub "${EnvironmentName}-highlight-clip"
+      TopicName: !Sub "${EnvironmentName}-clip-notifications"
 
   # -------------------------------------------------------------------------
   # CloudWatch Log Group – MediaLive channel logs
@@ -1036,11 +945,11 @@ Outputs:
     Export:
       Name: !Sub "${EnvironmentName}-live-archive-bucket"
 
-  HighlightStateMachineArn:
-    Description: Step Functions state machine ARN for highlight clipping
-    Value: !Ref HighlightClipStateMachine
+  HighlightLambdaArn:
+    Description: Lambda function for highlight clip processing
+    Value: !GetAtt ClipProcessorFunction.Arn
     Export:
-      Name: !Sub "${EnvironmentName}-sfn-arn"
+      Name: !Sub "${EnvironmentName}-clip-lambda"
 
   CloudFrontDomain:
     Description: CloudFront distribution domain name
