@@ -53,15 +53,10 @@ This is the same approach used by DAZN for live football on TikTok.
                     │        ▼ HLS                  ⑥ EventBridge ◀─┘ │            │
                     │  ┌───────────┐                     │            │            │
                     │  │MediaPackage│                    ▼            │            │
-                    │  │    v2     │           ┌──────────────────┐  │            │
-                    │  └─────┬─────┘           │  Step Functions  │⑦ │            │
-                    │        │                 │  (harvest +      │  │            │
-                    │        │                 │   transcode)     │  │            │
-                    │        │                 └────────┬─────────┘  │            │
-                    │        │                          │ ⑧          │            │
-                    │        │                 ┌────────▼─────────┐  │            │
-                    │        │                 │  MediaConvert    │  │            │
-                    │        │                 │  (MP4 + HLS VOD) │  │            │
+                    │  │  v2 (JITP) │           ┌──────────────────┐  │            │
+                    │  └─────┬─────┘           │  Lambda          │⑦ │            │
+                    │        │                 │  (time-shifted   │  │            │
+                    │        │                 │   clip fetch)    │  │            │
                     │        │                 └────────┬─────────┘  │            │
                     │        │                          │            │            │
                     │        │                 ┌────────▼─────────┐  │            │
@@ -69,6 +64,10 @@ This is the same approach used by DAZN for live football on TikTok.
                     │        │                 │  (clips bucket + │  │            │
                     │        │                 │   live archive)  │  │            │
                     │        │                 └────────┬─────────┘  │            │
+                    │        │                          │            │            │
+                    │        │                 ┌────────▼─────────┐  │            │
+                    │        │                 │   SNS (notify)   │  │            │
+                    │        │                 └─────────────────-┘  │            │
                     │        ▼                          ▼            │            │
                     │  ┌──────────────────────────────────────────┐  │            │
                     │  │       Amazon CloudFront  ⑨               │  │            │
@@ -103,10 +102,10 @@ This is the same approach used by DAZN for live football on TikTok.
 
 | Step | Service | What happens |
 |------|---------|--------------|
-| ⑥ | Elemental Inference → EventBridge | Inference detects key moments (goals, highlights) and fires an event with start/end timestamps |
-| ⑦ | Step Functions | State machine orchestrates the clip workflow: creates a MediaPackage harvest job, polls until complete |
-| ⑧ | MediaConvert | Produces frame-accurate MP4 and HLS VOD assets from the harvested segment, stored in S3 |
-| ⑨ | CloudFront | Serves VOD clips from S3 under the `/clips/*` path alongside the live stream |
+| ⑥ | Elemental Inference → EventBridge | Inference detects key moments (goals, tackles, celebrations) and fires a `Clip Metadata Generated` event |
+| ⑦ | Lambda | Fetches the highlight segment using MediaPackage v2 time-shifted playback, downloads segments, builds a VOD HLS manifest, saves to S3 |
+| | SNS | Sends a notification with clip details (event type, duration, S3 location) |
+| ⑨ | CloudFront | Serves VOD clips from S3 under the `/clips/*` path |
 
 ---
 
@@ -114,17 +113,20 @@ This is the same approach used by DAZN for live football on TikTok.
 
 | Resource | Purpose |
 |----------|---------|
-| `AWS::MediaLive::Input` | SRT push input — encoder calls into MediaLive |
-| `AWS::MediaLive::InputSecurityGroup` | Whitelist for SRT source IPs |
-| `AWS::MediaLive::Channel` | Core encoder: 16:9 in → 1080x1920 (9:16) out, H.264 @ 4.5-6 Mbps, 30fps |
+| `AWS::MediaLive::Input` | RTMP push input — OBS streams into MediaLive |
+| `AWS::MediaLive::InputSecurityGroup` | Whitelist for encoder source IPs |
+| `AWS::MediaLive::Channel` | Core encoder: 16:9 in → 1080x1920 (9:16) out, H.264 SMART_CROP via Elemental Inference |
+| `AWS::ElementalInference::Feed` | AI feed for smart cropping and highlight detection |
 | `AWS::MediaPackageV2::ChannelGroup` | Logical grouping for MediaPackage channels |
 | `AWS::MediaPackageV2::Channel` | Receives HLS output from MediaLive |
-| `AWS::MediaPackageV2::OriginEndpoint` | HLS endpoint — 2s segments (low latency), 30s DVR window |
-| `AWS::S3::Bucket` | Two buckets: **live-archive** (full stream, 7-day retention) and **clips** (highlight VOD, 30-day retention) |
-| `AWS::CloudFront::Distribution` | CDN — live origin (MediaPackage) + VOD origin (S3) |
-| `AWS::Events::Rule` | EventBridge rule — listens for Inference highlight events |
-| `AWS::StepFunctions::StateMachine` | Orchestrates harvest → transcode workflow |
-| `AWS::IAM::Role` × 5 | Least-privilege roles for each service |
+| `AWS::MediaPackageV2::OriginEndpoint` | HLS endpoint — 6s segments, 60s DVR window, 900s startover (time-shifted playback) |
+| `AWS::MediaPackageV2::OriginEndpointPolicy` | Allows CloudFront/public access to the endpoint |
+| `AWS::Lambda::Function` | Clip processor — fetches highlights via time-shifted playback, saves to S3 |
+| `AWS::Events::Rule` | EventBridge rule — triggers Lambda on `Clip Metadata Generated` events |
+| `AWS::SNS::Topic` | Notifications when highlight clips are saved |
+| `AWS::S3::Bucket` | Two buckets: **live-archive** (7-day retention) and **clips** (30-day retention) |
+| `AWS::CloudFront::Distribution` | CDN — live origin (MediaPackage) + VOD clips (S3) |
+| `AWS::IAM::Role` × 3 | Least-privilege roles (MediaLive, MediaPackage, Lambda) |
 | `AWS::Logs::LogGroup` | MediaLive channel logs (7-day retention) |
 
 ---
